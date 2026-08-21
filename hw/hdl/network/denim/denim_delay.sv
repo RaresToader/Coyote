@@ -118,13 +118,21 @@ logic pkt_start;
 logic pkt_first;
 logic admit;
 logic reject_this;
-logic wr_fire;
+
+(* max_fanout = 8 *) logic wr_fire;
 
 assign pkt_start   = ~in_pkt_not_first & s_axis_tvalid;
 assign pkt_first   = pkt_start & s_axis_tready;
 
-assign admit       = ((FIFO_BEATS - occupancy) >= MAX_PKT_BEATS) &&
-                     (meta_occ < META_ENTRIES);
+always_ff @(posedge nclk) begin
+    if (~nresetn) begin
+        admit <= 1'b1;
+    end else begin
+        admit <= ((FIFO_BEATS - occupancy) > MAX_PKT_BEATS) &&
+                 (meta_occ < (META_ENTRIES - 1));
+    end
+end
+
 assign reject_this = pkt_start ? ~admit : rejecting_r;
 assign wr_fire     = s_axis_tvalid & s_axis_tready & ~reject_this;
 

@@ -37,6 +37,7 @@ import denim_pkg::*;
 module denim_chain #(
     parameter integer           DATA_BITS  = 512,
     parameter integer           FIFO_BEATS = 512,
+    parameter integer           META_ENTRIES = 512,
     parameter integer           PMTU_BYTES = 4096
 ) (
     /* Network stream, nclk domain */
@@ -81,6 +82,8 @@ logic [31:0] drop_count;
 logic [31:0] ecn_count;
 logic [31:0] ovf_count [N_RULES];
 logic [31:0] ovf_total;
+logic [N_RULES-1:0] psn_captured;
+logic [N_RULES-1:0] rule_armed;
 
 denim_cnfg inst_cnfg (
     .s_cnfg_tdata   (s_cnfg_tdata),
@@ -104,6 +107,8 @@ denim_cnfg inst_cnfg (
     .ecn_count      (ecn_count),
     .ovf_count      (ovf_count),
     .ovf_total      (ovf_total),
+    .psn_captured   (psn_captured),
+    .rule_armed     (rule_armed),
 
     .nclk           (nclk),
     .nresetn        (nresetn)
@@ -117,7 +122,8 @@ logic [DATA_BITS/8-1:0] flt_tkeep, drp_tkeep, ecn_tkeep;
 logic                   flt_tlast, drp_tlast, ecn_tlast;
 logic                   flt_tvalid, drp_tvalid, ecn_tvalid;
 logic                   flt_tready, drp_tready, ecn_tready;
-logic [TAG_BITS-1:0]    flt_tid, drp_tid, ecn_tid;
+
+(* max_fanout = 16 *) logic [TAG_BITS-1:0] flt_tid, drp_tid, ecn_tid;
 
 denim_filter #(.DATA_BITS(DATA_BITS)) inst_filter (
     .s_axis_tdata(s_axis_tdata), .s_axis_tkeep(s_axis_tkeep),
@@ -130,6 +136,7 @@ denim_filter #(.DATA_BITS(DATA_BITS)) inst_filter (
 
     .rules(rules), .global_en(global_en), .roce_port(roce_port),
     .match_count(match_count), .all_pkts(all_pkts), .roce_pkts(roce_pkts),
+    .psn_captured(psn_captured), .rule_armed(rule_armed),
     .ctr_clear(ctr_clear),
 
     .nclk(nclk), .nresetn(nresetn)
@@ -165,7 +172,8 @@ denim_ecn #(.DATA_BITS(DATA_BITS)) inst_ecn (
 
 // The tag ends here. Downstream is the IP handler, which knows nothing about DENIM and must see an ordinary AXI4-Stream.
 denim_delay #(
-    .DATA_BITS(DATA_BITS), .FIFO_BEATS(FIFO_BEATS), .PMTU_BYTES(PMTU_BYTES)
+    .DATA_BITS(DATA_BITS), .FIFO_BEATS(FIFO_BEATS),
+    .META_ENTRIES(META_ENTRIES), .PMTU_BYTES(PMTU_BYTES)
 ) inst_delay (
     .s_axis_tdata(ecn_tdata), .s_axis_tkeep(ecn_tkeep),
     .s_axis_tlast(ecn_tlast), .s_axis_tvalid(ecn_tvalid),

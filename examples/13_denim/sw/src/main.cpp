@@ -24,6 +24,7 @@
  * SOFTWARE.
  */
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -51,9 +52,12 @@ void write_regs(coyote::cThread &t,
     for (const auto &w : writes) t.setCSR(w.second, w.first);
 }
 
+uint16_t shell_minor = 0;
+
 bool check_version(coyote::cThread &t) {
     const uint32_t v     = static_cast<uint32_t>(t.getCSR(REG_VERSION));
     const uint16_t major = v >> 16,          minor = v & 0xFFFF;
+    shell_minor = minor;
     const uint16_t want_major = VERSION_EXPECTED >> 16,
                    want_minor = VERSION_EXPECTED & 0xFFFF;
 
@@ -87,6 +91,12 @@ void clear_slot(coyote::cThread &t, int slot) {
  * Install a rule and confirm if it was successful.
  */
 bool install_rule(coyote::cThread &t, int slot, const Rule &r, uint32_t nclk_mhz) {
+    if (r.shots != 0 && shell_minor < 3) {
+        std::cerr << "denim_ctl: this shell is 1." << shell_minor
+                  << " and has no shot limit, so 'once' and 'shots' cannot be "
+                     "honoured.\n";
+        return false;
+    }
     clear_slot(t, slot);
     write_regs(t, rule_to_csr_writes(r, slot));
 
@@ -127,12 +137,6 @@ int load_file(coyote::cThread &t, const std::string &path, uint32_t nclk_mhz) {
                 std::cerr << path << ":" << lineno << ": " << err << "\n";
                 return 1;
             case ParseResult::Ok:
-                if (r.psn_relative) {
-                    std::cerr << path << ":" << lineno
-                              << ": relative PSN needs the connection's initial PSN, "
-                                 "which this tool cannot resolve yet\n";
-                    return 1;
-                }
                 rules.push_back(r);
                 break;
         }
@@ -190,6 +194,13 @@ void print_status(coyote::cThread &t, uint32_t nclk_mhz) {
 
     bool any_enabled = false;
 
+    // Which relative rules have latched a base PSN.
+    const uint64_t dbg      = t.getCSR(REG_DEBUG);
+    const uint64_t captured = (dbg >> DBG_CAPTURED_SHIFT) & 0xFF;
+
+    // Which rules may still fire.
+    const uint64_t armed    = (dbg >> DBG_ARMED_SHIFT) & 0xFF;
+
     std::cout << "\nslot  matched     overflow    rule\n";
     for (int i = 0; i < N_RULES; i++) {
         uint64_t reg[RULE_STRIDE];
@@ -204,7 +215,17 @@ void print_status(coyote::cThread &t, uint32_t nclk_mhz) {
         std::cout << std::setw(4) << i << "  " << std::setw(10)
                   << (counters & 0xFFFFFFFF) << "  " << std::setw(10) << (counters >> 32)
                   << "    " << (enabled ? rule_to_string(r, nclk_mhz)
-                                        : std::string("(empty)")) << "\n";
+                                        : std::string("(empty)"))
+                  << (enabled && r.psn_relative
+                          ? ((captured >> i) & 1 ? "   [base captured]"
+                                                 : "   [waiting for first packet]")
+                          : "")
+                  << (enabled && r.shots != 0
+                          ? ((armed >> i) & 1
+                                 ? "   [" + std::to_string(r.shots - std::min<uint32_t>(r.shots, counters & 0xFFFFFFFF)) + " of " + std::to_string(r.shots) + " shots left]"
+                                 : std::string("   [spent]"))
+                          : std::string(""))
+                  << "\n";
     }
 
     if (any_enabled && !(ctrl & CTRL_GLOBAL_EN)) {
@@ -315,11 +336,6 @@ int main(int argc, char *argv[]) {
         const auto res = parse_rule(args["rule"].as<std::string>(), r, err, nclk_mhz);
         if (res != ParseResult::Ok) {
             std::cerr << "denim_ctl: " << (err.empty() ? "not a rule" : err) << "\n";
-            return 1;
-        }
-        if (r.psn_relative) {
-            std::cerr << "denim_ctl: relative PSN needs the connection's initial PSN, "
-                         "which this tool cannot resolve yet\n";
             return 1;
         }
         if (!install_rule(cthread, slot, r, nclk_mhz)) return 1;

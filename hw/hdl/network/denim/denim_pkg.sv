@@ -75,6 +75,9 @@ typedef struct packed {
     logic        en;
     logic        qpn_en;
     logic        psn_en;
+    // psn_lo and psn_hi are offsets from the connection's first observed PSN
+    // rather than absolute values.
+    logic        psn_rel;
     logic        src_en;
     logic        dst_en;
     logic        op_en;
@@ -86,6 +89,8 @@ typedef struct packed {
     logic [7:0]  opcode;
     logic [3:0]  eff_mask;
     logic [31:0] eff_param;
+    // How many packets this rule may act on before it disarms itself.
+    logic [15:0] shots;
 } denim_rule_t;
 
 endpackage

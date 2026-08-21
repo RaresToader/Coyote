@@ -59,11 +59,9 @@ struct Rule {
     uint32_t psn_lo = 0;
     uint32_t psn_hi = 0;
 
-    // psn +K is relative to the connection's initial PSN, which only exists at
-    // run time. Held here until resolved against rdma_service metadata, until
-    // then psn_lo and psn_hi are meaningless.
+    // psn +K and psn +A-B are relative to the connection's initial PSN, which
+    // only exists at run time.
     bool     psn_relative = false;
-    uint32_t psn_offset   = 0;
 
     bool     src_en = false;
     uint32_t ip_src = 0;
@@ -75,6 +73,9 @@ struct Rule {
 
     uint8_t  eff_mask     = 0;
     uint32_t delay_cycles = 0;
+
+    // How many packets this rule may act on before it disarms itself
+    uint32_t shots        = 0;
 };
 
 enum class ParseResult {
@@ -94,7 +95,6 @@ ParseResult parse_rule(const std::string &line, Rule &out, std::string &err,
 /**
  * Resolve a relative PSN once the connection's initial PSN is known.
  */
-void resolve_relative_psn(Rule &r, uint32_t initial_psn);
 
 /**
  * Register writes that install a rule into a slot, in order.

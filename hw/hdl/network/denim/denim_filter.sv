@@ -67,6 +67,10 @@ module denim_filter #(
     output logic [31:0]             roce_pkts,
     input  logic                    ctr_clear,
 
+    // Which relative rules have captured their base PSN, for readback.
+    output logic [N_RULES-1:0]      psn_captured,
+    output logic [N_RULES-1:0]      rule_armed,
+
     input  logic                    nclk,
     input  logic                    nresetn
 );
@@ -129,16 +133,61 @@ end
 // All slots compared in parallel; a condition whose enable is clear is a
 // wildcard, so a slot with no conditions matches every RoCE packet.
 logic [N_RULES-1:0] hit;
+logic [N_RULES-1:0] pre_hit;
+logic [N_RULES-1:0] psn_ok;
+logic [N_RULES-1:0] capture_now;
+
+logic [23:0] psn_lo_eff [N_RULES];
+logic [23:0] psn_hi_eff [N_RULES];
 
 always_comb begin
     for (int i = 0; i < N_RULES; i++) begin
-        hit[i] = rules[i].en && global_en && is_roce
-              && (!rules[i].qpn_en || (bth_qpn == rules[i].qpn))
-              && (!rules[i].psn_en || (bth_psn >= rules[i].psn_lo &&
-                                       bth_psn <= rules[i].psn_hi))
-              && (!rules[i].src_en || (ip_src == rules[i].ip_src))
-              && (!rules[i].dst_en || (ip_dst == rules[i].ip_dst))
-              && (!rules[i].op_en  || (bth_op == rules[i].opcode));
+        // Everything except the PSN condition.
+        pre_hit[i] = rules[i].en && global_en && is_roce
+                  && (!rules[i].qpn_en || (bth_qpn == rules[i].qpn))
+                  && (!rules[i].src_en || (ip_src == rules[i].ip_src))
+                  && (!rules[i].dst_en || (ip_dst == rules[i].ip_dst))
+                  && (!rules[i].op_en  || (bth_op == rules[i].opcode));
+
+        // A relative rule matches nothing until it has captured, the offset
+        // is meaningless before then.
+        psn_ok[i] = !rules[i].psn_en ? 1'b1
+                  : (!rules[i].psn_rel || psn_captured[i]) &&
+                    (bth_psn >= psn_lo_eff[i]) &&
+                    (bth_psn <= psn_hi_eff[i]);
+
+        hit[i] = pre_hit[i] && psn_ok[i] && rule_armed[i];
+
+        // The first packet matching everything but the PSN condition defines
+        // the base for a relative rule. It is not itself a match.
+        capture_now[i] = pkt_first && pre_hit[i] && rules[i].psn_rel &&
+                         !psn_captured[i];
+    end
+end
+
+/**
+ * Relative PSN base capture
+ */
+always_ff @(posedge nclk) begin
+    if (~nresetn) begin
+        psn_captured <= '0;
+        for (int i = 0; i < N_RULES; i++) begin
+            psn_lo_eff[i] <= '0;
+            psn_hi_eff[i] <= '0;
+        end
+    end else begin
+        for (int i = 0; i < N_RULES; i++) begin
+            if (!rules[i].en)        psn_captured[i] <= 1'b0;
+            else if (capture_now[i]) psn_captured[i] <= 1'b1;
+
+            if (!rules[i].psn_rel) begin
+                psn_lo_eff[i] <= rules[i].psn_lo;
+                psn_hi_eff[i] <= rules[i].psn_hi;
+            end else if (capture_now[i]) begin
+                psn_lo_eff[i] <= bth_psn + rules[i].psn_lo;
+                psn_hi_eff[i] <= bth_psn + rules[i].psn_hi;
+            end
+        end
     end
 end
 
@@ -167,24 +216,64 @@ end
  */
 // Latched on the first beat and held for the rest of the packet.
 logic [TAG_BITS-1:0] tag_new;
-logic [TAG_BITS-1:0] tag_held;
 
 assign tag_new = {win_mask, win_id, win_valid};
 
-always_ff @(posedge nclk) begin
-    if (~nresetn) begin
-        tag_held <= '0;
-    end else if (pkt_first) begin
-        tag_held <= tag_new;
+/**
+ * Shot limit
+ */
+// A rule may act on at most rules[i].shots packets, zero meaning unlimited
+// (default case).
+// The point is to be able to selectively introduce e.g. drops, for just
+// a limited number of packets.
+logic [15:0]        shot_count [N_RULES];
+logic [N_RULES-1:0] fire;
+logic [N_RULES-1:0] spent;
+
+always_comb begin
+    for (int i = 0; i < N_RULES; i++) begin
+        fire[i]  = pkt_first && win_valid && (win_id == i[RULE_ID_BITS-1:0]);
+        spent[i] = (rules[i].shots != 16'd0) &&
+                   ((shot_count[i] + 16'd1) >= rules[i].shots);
     end
 end
 
-assign m_axis_tid = pkt_start ? tag_new : tag_held;
+always_ff @(posedge nclk) begin
+    if (~nresetn) begin
+        rule_armed <= '1;
+        for (int i = 0; i < N_RULES; i++) shot_count[i] <= '0;
+    end else begin
+        for (int i = 0; i < N_RULES; i++) begin
+            // A disabled slot rearms and forgets its count.
+            if (!rules[i].en) begin
+                rule_armed[i] <= 1'b1;
+                shot_count[i] <= '0;
+            end else if (fire[i]) begin
+                shot_count[i] <= shot_count[i] + 16'd1;
+                if (spent[i]) rule_armed[i] <= 1'b0;
+            end
+        end
+    end
+end
 
 /**
  * Counters
  */
-// match_count tracks matching
+logic                    ctr_fire;
+logic                    ctr_valid;
+logic                    ctr_roce;
+logic [RULE_ID_BITS-1:0] ctr_id;
+
+always_ff @(posedge nclk) begin
+    // A clear discards a count still in flight.
+    if (~nresetn || ctr_clear) ctr_fire <= 1'b0;
+    else                       ctr_fire <= pkt_first;
+
+    ctr_valid <= win_valid;
+    ctr_roce  <= is_roce;
+    ctr_id    <= win_id;
+end
+
 always_ff @(posedge nclk) begin
     if (~nresetn || ctr_clear) begin
         all_pkts  <= '0;
@@ -192,25 +281,51 @@ always_ff @(posedge nclk) begin
         for (int i = 0; i < N_RULES; i++) begin
             match_count[i] <= '0;
         end
-    end else if (pkt_first) begin
+    end else if (ctr_fire) begin
         all_pkts <= all_pkts + 32'd1;
-        if (is_roce) begin
+        if (ctr_roce) begin
             roce_pkts <= roce_pkts + 32'd1;
         end
-        if (win_valid) begin
-            match_count[win_id] <= match_count[win_id] + 32'd1;
+        if (ctr_valid) begin
+            match_count[ctr_id] <= match_count[ctr_id] + 32'd1;
         end
     end
 end
 
 /**
- * Stream passthrough
+ * Output stage
  */
 // The filter observes and never modifies.
-assign m_axis_tdata  = s_axis_tdata;
-assign m_axis_tkeep  = s_axis_tkeep;
-assign m_axis_tlast  = s_axis_tlast;
-assign m_axis_tvalid = s_axis_tvalid;
+(* max_fanout = 64 *) logic out_en;
+
+assign out_en = m_axis_tready;
+
+always_ff @(posedge nclk) begin
+    if (~nresetn) begin
+        m_axis_tvalid <= 1'b0;
+        m_axis_tlast  <= 1'b0;
+    end else if (out_en) begin
+        m_axis_tvalid <= s_axis_tvalid;
+        m_axis_tlast  <= s_axis_tlast;
+    end
+end
+
+always_ff @(posedge nclk) begin
+    if (out_en) begin
+        m_axis_tdata <= s_axis_tdata;
+        m_axis_tkeep <= s_axis_tkeep;
+    end
+end
+
+always_ff @(posedge nclk) begin
+    if (~nresetn) begin
+        m_axis_tid <= '0;
+    end else if (pkt_first) begin
+        m_axis_tid <= tag_new;
+    end
+end
+
+// tready comes straight from downstream
 assign s_axis_tready = m_axis_tready;
 
 endmodule

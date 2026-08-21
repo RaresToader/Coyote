@@ -56,7 +56,8 @@ module denim_top (
 // FIFO_BEATS sets how much delay the block can hold at line rate
 denim_chain #(
     .DATA_BITS      (AXI_NET_BITS),
-    .FIFO_BEATS     (4096),
+    .FIFO_BEATS     (512),
+    .META_ENTRIES   (256),
     .PMTU_BYTES     (PMTU_BYTES)
 ) inst_chain (
     .s_axis_tdata   (s_axis_net.tdata),

@@ -26,13 +26,15 @@ under first-match-wins, two rules with identical conditions would never both fir
 
 | | |
 |---|---|
-| Conditions | `qpn N`, `psn N`, `psn A-B`, `psn +K`, `src_ip a.b.c.d`, `dst_ip a.b.c.d`, `opcode 0xNN` |
+| Conditions | `qpn N`, `psn N`, `psn A-B`, `psn +K`, `psn +A-B`, `src_ip a.b.c.d`, `dst_ip a.b.c.d`, `opcode 0xNN` |
 | Effects | `ecn`, `drop`, `delay <t>` (`ns` or `us`), `count` |
+| Limits | `once`, `shots N` = how many packets the rule may act on before it disarms |
 
 ```
 qpn 3, psn 50-150   : delay 1us       # emulate queueing over a PSN window
 src_ip 10.1.212.62  : ecn             # fake congestion signal per sender
 qpn 2, psn +100     : drop            # single loss at a relative PSN
+qpn 0, psn +10-15   : ecn             # mark a window six packets wide
 qpn 2               : count           # monitor only, no effect
 qpn 4, psn 0-500    : ecn, delay 2us  # two effects on one packet
 ```
@@ -41,9 +43,21 @@ Match values are written as plain host integers, `src_ip 10.1.212.62` is
 `0x0A01D43E`. The conversion to network byte order happens in hardware, at
 field extraction, so nothing in software byte-swaps.
 
-`psn +K` is relative to the connection's initial PSN.
+`psn +K` and `psn +A-B` are relative to the connection's initial PSN. That only
+exists at run time, so the **filter** resolves it: the first packet matching the
+rule's other conditions defines a base, which is used for both bounds. Until
+that happens the rule matches nothing, and `--status` reports the slot as
+`[waiting for first packet]` rather than `[armed]`.
 
 There are **8 slots**. `count` exists for dry runs.
+
+`shots N` is the bound. The rule acts on at most N packets and then disarms
+itself.
+
+```
+qpn 0, psn +10-15 : drop, shots 6      # six drops
+qpn 0, psn +10    : drop, once         # exactly one, the shorthand for shots 1
+```
 
 ## Building
 

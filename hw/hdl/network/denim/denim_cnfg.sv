@@ -62,6 +62,8 @@ module denim_cnfg (
     input  logic [31:0]         ecn_count,
     input  logic [31:0]         ovf_count [N_RULES],
     input  logic [31:0]         ovf_total,
+    input  logic [N_RULES-1:0]  psn_captured,
+    input  logic [N_RULES-1:0]  rule_armed,
 
     input  logic                nclk,
     input  logic                nresetn
@@ -69,7 +71,7 @@ module denim_cnfg (
 
 // Bump on any change to the register map. denim_ctl refuses to run on a mismatch.
 // {major[15:0], minor[15:0]} 
-localparam logic [31:0] DENIM_VERSION = 32'h0001_0001;
+localparam logic [31:0] DENIM_VERSION = 32'h0001_0003;
 
 localparam integer N_GLOBAL   = 8;
 localparam integer RULE_STRIDE = 8;
@@ -174,6 +176,7 @@ always_comb begin
         rules[r].psn_lo    = rule_reg[r][FLD_MATCH_PSN][23:0];
         rules[r].psn_hi    = rule_reg[r][FLD_MATCH_PSN][55:32];
         rules[r].psn_en    = rule_reg[r][FLD_MATCH_PSN][56];
+        rules[r].psn_rel   = rule_reg[r][FLD_MATCH_PSN][57];
 
         rules[r].ip_src    = rule_reg[r][FLD_MATCH_IP][31:0];
         rules[r].ip_dst    = rule_reg[r][FLD_MATCH_IP][63:32];
@@ -184,6 +187,9 @@ always_comb begin
         rules[r].opcode    = rule_reg[r][FLD_MATCH_FLAGS][15:8];
 
         rules[r].eff_mask  = rule_reg[r][FLD_EFFECT_MASK][3:0];
+        // Spare bits of the same register, so a shot limit needs no new
+        // address and the stride stays at eight.
+        rules[r].shots     = rule_reg[r][FLD_EFFECT_MASK][31:16];
         rules[r].eff_param = rule_reg[r][FLD_EFFECT_PARM][31:0];
 
         delay_cycles[r]    = rule_reg[r][FLD_EFFECT_PARM][31:0];
@@ -233,8 +239,9 @@ always_comb begin
             REG_EFF_COUNT[2:0]: stat_val = {ovf_total, drop_count};
             REG_ROCE_PORT[2:0]: stat_val = {48'd0, port_reg};
             REG_ECN_COUNT[2:0]: stat_val = {32'd0, ecn_count};
-            REG_DEBUG[2:0]:     stat_val = {16'd0, dbg_last_data,
-                                            dbg_last_addr, dbg_beats};
+            REG_DEBUG[2:0]:     stat_val = {rule_armed, psn_captured,
+                                            dbg_last_data, dbg_last_addr,
+                                            dbg_beats};
             default:            stat_val = '0;
         endcase
     end else if (stat_fld == FLD_COUNTERS[2:0]) begin

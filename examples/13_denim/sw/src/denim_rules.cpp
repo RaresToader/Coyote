@@ -138,6 +138,17 @@ bool parse_delay(const std::string &s, uint32_t nclk_mhz, uint32_t &cycles,
     return true;
 }
 
+// A relative window that includes offset zero can never match. The base is
+// captured from the packet that arms the rule.
+bool check_relative_zero(const Rule &r, const std::string &arg, std::string &err) {
+    if (r.psn_relative && r.psn_lo == 0) {
+        err = "psn '" + arg + "' includes offset 0, which can never match: the "
+              "base is captured from that packet, not matched against it";
+        return false;
+    }
+    return true;
+}
+
 bool parse_condition(const std::string &cond, Rule &r, std::string &err) {
     const auto w = words(cond);
     if (w.empty()) {
@@ -165,21 +176,23 @@ bool parse_condition(const std::string &cond, Rule &r, std::string &err) {
 
     if (key == "psn") {
         r.psn_en = true;
-        if (arg[0] == '+') {
-            uint64_t v;
-            if (!parse_uint(arg.substr(1), v) || v > 0xFFFFFF) {
-                err = "psn offset '" + arg + "' is not a 24 bit value";
+
+        std::string body = arg;
+        if (body[0] == '+') {
+            r.psn_relative = true;
+            body = body.substr(1);
+            if (body.empty()) {
+                err = "psn '" + arg + "' needs an offset after the '+'";
                 return false;
             }
-            r.psn_relative = true;
-            r.psn_offset = static_cast<uint32_t>(v);
-            return true;
         }
-        const auto dash = arg.find('-');
+        const std::string &arg_ = body;
+
+        const auto dash = arg_.find('-');
         if (dash != std::string::npos) {
             uint64_t lo, hi;
-            if (!parse_uint(arg.substr(0, dash), lo) ||
-                !parse_uint(arg.substr(dash + 1), hi)) {
+            if (!parse_uint(arg_.substr(0, dash), lo) ||
+                !parse_uint(arg_.substr(dash + 1), hi)) {
                 err = "psn range '" + arg + "' is malformed";
                 return false;
             }
@@ -193,15 +206,15 @@ bool parse_condition(const std::string &cond, Rule &r, std::string &err) {
             }
             r.psn_lo = static_cast<uint32_t>(lo);
             r.psn_hi = static_cast<uint32_t>(hi);
-            return true;
+            return check_relative_zero(r, arg, err);
         }
         uint64_t v;
-        if (!parse_uint(arg, v) || v > 0xFFFFFF) {
+        if (!parse_uint(arg_, v) || v > 0xFFFFFF) {
             err = "psn '" + arg + "' is not a 24 bit value";
             return false;
         }
         r.psn_lo = r.psn_hi = static_cast<uint32_t>(v);
-        return true;
+        return check_relative_zero(r, arg, err);
     }
 
     if (key == "src_ip" || key == "dst_ip") {
@@ -250,6 +263,29 @@ bool parse_effect(const std::string &eff, Rule &r, uint32_t nclk_mhz,
             return false;
         }
         r.eff_mask |= (key == "ecn") ? EFF_ECN : (key == "drop") ? EFF_DROP : EFF_COUNT;
+        return true;
+    }
+
+    if (key == "once") {
+        if (w.size() != 1) {
+            err = "'once' takes no argument";
+            return false;
+        }
+        r.shots = 1;
+        return true;
+    }
+
+    if (key == "shots") {
+        if (w.size() != 2) {
+            err = "'shots' needs a count, e.g. shots 6";
+            return false;
+        }
+        uint64_t v;
+        if (!parse_uint(w[1], v) || v == 0 || v > 0xFFFF) {
+            err = "shots '" + w[1] + "' is not a count between 1 and 65535";
+            return false;
+        }
+        r.shots = static_cast<uint32_t>(v);
         return true;
     }
 
@@ -319,12 +355,6 @@ ParseResult parse_rule(const std::string &line, Rule &out, std::string &err,
     return ParseResult::Ok;
 }
 
-void resolve_relative_psn(Rule &r, uint32_t initial_psn) {
-    if (!r.psn_relative) return;
-    r.psn_lo = r.psn_hi = (initial_psn + r.psn_offset) & 0xFFFFFF;
-    r.psn_relative = false;
-}
-
 std::vector<std::pair<uint32_t, uint64_t>> rule_to_csr_writes(const Rule &r, int slot) {
     std::vector<std::pair<uint32_t, uint64_t>> w;
 
@@ -333,6 +363,7 @@ std::vector<std::pair<uint32_t, uint64_t>> rule_to_csr_writes(const Rule &r, int
 
     w.emplace_back(rule_reg(slot, FLD_MATCH_PSN),
                    (r.psn_en ? (1ull << 56) : 0ull) |
+                   (r.psn_relative ? (1ull << 57) : 0ull) |
                    (static_cast<uint64_t>(r.psn_hi) << 32) | r.psn_lo);
 
     w.emplace_back(rule_reg(slot, FLD_MATCH_IP),
@@ -344,7 +375,8 @@ std::vector<std::pair<uint32_t, uint64_t>> rule_to_csr_writes(const Rule &r, int
                    (r.op_en  ? 4ull : 0ull) |
                    (static_cast<uint64_t>(r.opcode) << 8));
 
-    w.emplace_back(rule_reg(slot, FLD_EFFECT_MASK), r.eff_mask);
+    w.emplace_back(rule_reg(slot, FLD_EFFECT_MASK),
+                   (static_cast<uint64_t>(r.shots) << 16) | r.eff_mask);
     w.emplace_back(rule_reg(slot, FLD_EFFECT_PARAM), r.delay_cycles);
 
     w.emplace_back(rule_reg(slot, FLD_ENABLE), 1ull);
@@ -362,9 +394,10 @@ Rule rule_from_regs(const uint64_t reg[8], bool &enabled) {
     r.qpn_en = (reg[FLD_MATCH_QPN] >> 32) & 1ull;
     r.qpn    = static_cast<uint32_t>(reg[FLD_MATCH_QPN] & 0xFFFFFFull);
 
-    r.psn_en = (reg[FLD_MATCH_PSN] >> 56) & 1ull;
-    r.psn_lo = static_cast<uint32_t>(reg[FLD_MATCH_PSN] & 0xFFFFFFull);
-    r.psn_hi = static_cast<uint32_t>((reg[FLD_MATCH_PSN] >> 32) & 0xFFFFFFull);
+    r.psn_en       = (reg[FLD_MATCH_PSN] >> 56) & 1ull;
+    r.psn_relative = (reg[FLD_MATCH_PSN] >> 57) & 1ull;
+    r.psn_lo       = static_cast<uint32_t>(reg[FLD_MATCH_PSN] & 0xFFFFFFull);
+    r.psn_hi       = static_cast<uint32_t>((reg[FLD_MATCH_PSN] >> 32) & 0xFFFFFFull);
 
     r.ip_src = static_cast<uint32_t>(reg[FLD_MATCH_IP] & 0xFFFFFFFFull);
     r.ip_dst = static_cast<uint32_t>(reg[FLD_MATCH_IP] >> 32);
@@ -375,9 +408,10 @@ Rule rule_from_regs(const uint64_t reg[8], bool &enabled) {
     r.opcode = static_cast<uint8_t>((reg[FLD_MATCH_FLAGS] >> 8) & 0xFFull);
 
     r.eff_mask     = static_cast<uint8_t>(reg[FLD_EFFECT_MASK] & 0xFull);
+    r.shots        = static_cast<uint32_t>((reg[FLD_EFFECT_MASK] >> 16) & 0xFFFFull);
     r.delay_cycles = static_cast<uint32_t>(reg[FLD_EFFECT_PARAM] & 0xFFFFFFFFull);
 
-    r.psn_relative = false;
+    // Bit 57 says the bounds are offsets rather than absolute PSNs.
     return r;
 }
 
@@ -387,12 +421,11 @@ std::string rule_to_string(const Rule &r, uint32_t nclk_mhz) {
 
     if (r.qpn_en) conds.push_back("qpn " + std::to_string(r.qpn));
     if (r.psn_en) {
-        if (r.psn_relative) {
-            conds.push_back("psn +" + std::to_string(r.psn_offset));
-        } else if (r.psn_lo == r.psn_hi) {
-            conds.push_back("psn " + std::to_string(r.psn_lo));
+        const std::string rel = r.psn_relative ? "+" : "";
+        if (r.psn_lo == r.psn_hi) {
+            conds.push_back("psn " + rel + std::to_string(r.psn_lo));
         } else {
-            conds.push_back("psn " + std::to_string(r.psn_lo) + "-" +
+            conds.push_back("psn " + rel + std::to_string(r.psn_lo) + "-" +
                             std::to_string(r.psn_hi));
         }
     }
@@ -428,6 +461,8 @@ std::string rule_to_string(const Rule &r, uint32_t nclk_mhz) {
     }
     if (r.eff_mask & EFF_COUNT) effs.push_back("count");
     if (effs.empty()) effs.push_back("(none)");
+    if (r.shots == 1)      effs.push_back("once");
+    else if (r.shots != 0) effs.push_back("shots " + std::to_string(r.shots));
 
     for (size_t i = 0; i < effs.size(); i++) {
         os << effs[i];

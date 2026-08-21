@@ -37,8 +37,10 @@
 namespace denim {
 
 // {major[15:0], minor[15:0]}. Must track DENIM_VERSION in denim_cnfg.sv.
-// 1.1 formalised register 6 and added SLV_CFG_PARTIAL at register 7 bit 1.
-constexpr uint32_t VERSION_EXPECTED = 0x0001'0001;
+// 1.1 formalised register 6 and added SLV_CFG_PARTIAL at register 7 bit 1
+// 1.2 added relative PSN
+// 1.3 added the per-rule shot limit and the armed bitmap
+constexpr uint32_t VERSION_EXPECTED = 0x0001'0003;
 
 constexpr int N_RULES     = 8;
 constexpr int N_GLOBAL    = 8;
@@ -62,6 +64,8 @@ enum GlobalReg : uint32_t {
 constexpr int DBG_BEATS_SHIFT     = 0;    // [23:0]  config beats applied
 constexpr int DBG_LAST_ADDR_SHIFT = 24;   // [31:24] address of the last beat
 constexpr int DBG_LAST_DATA_SHIFT = 32;   // [47:32] low 16 bits of its data
+constexpr int DBG_CAPTURED_SHIFT  = 48;   // [55:48] rules that captured a base PSN
+constexpr int DBG_ARMED_SHIFT     = 56;   // [63:56] rules that may still fire
 
 // CTRL bits
 constexpr uint64_t CTRL_GLOBAL_EN = 1ull << 0;
@@ -75,10 +79,10 @@ constexpr uint64_t SLV_CFG_PARTIAL = 1ull << 1;   // a sub-word write was seen
 enum RuleField : uint32_t {
     FLD_ENABLE       = 0,   // RW  [0] enable, written last so arming is atomic
     FLD_MATCH_QPN    = 1,   // RW  [23:0] qpn, [32] field enable
-    FLD_MATCH_PSN    = 2,   // RW  [23:0] lo, [55:32] hi, [56] field enable
+    FLD_MATCH_PSN    = 2,   // RW  [23:0] lo, [55:32] hi, [56] enable, [57] relative
     FLD_MATCH_IP     = 3,   // RW  {dst[63:32], src[31:0]}
     FLD_MATCH_FLAGS  = 4,   // RW  [0] src_en, [1] dst_en, [2] op_en, [15:8] opcode
-    FLD_EFFECT_MASK  = 5,   // RW  [3:0] {count, delay, drop, ecn}
+    FLD_EFFECT_MASK  = 5,   // RW  [3:0] {count, delay, drop, ecn}, [31:16] shots
     FLD_EFFECT_PARAM = 6,   // RW  [31:0] delay in nclk cycles
     FLD_COUNTERS     = 7,   // RO  {overflow[63:32], match[31:0]}
 };
